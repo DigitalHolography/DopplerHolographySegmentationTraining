@@ -4,6 +4,26 @@ import onnx
 import onnxruntime as ort
 import torch.nn as nn
 import time
+import gc
+from pathlib import Path
+import tqdm
+
+import data_utils
+from models.swinunet.vision_transformer import SwinUnet
+from models.nnwnet.nnwnet import WNet2D
+from models.msu_unet.msu_unet import MSU_Net
+from models.cenet.net import CENet
+from models.unet_plus_plus.unet_plus_plus import NestedUNet
+from models.cstanet.CSTANet import CSTANet
+from models.ce_net.ce_net import CE_Net
+from models.uresnet.uresnet import UResNet
+from models.attention_unet.attention_unet import AttentionUNet
+from models.r2unet.r2unet import R2UNet
+from models.wnet.wnet import WNet
+from models.iternet.iternet import Iternet
+from models.rrwnet.rrwnet_model import RRWNet
+from models.rvbsin.rvbsin import VesselSegNetwork
+from models.custom_unet.unet import UNet
 
 def export_jit(model, path, input_shape=(1, 1, 512, 512)):
     model.eval()
@@ -227,3 +247,234 @@ class StateDictModel:
 
     def num_parameters(self):
         return count_parameters(self.model)
+    
+
+def get_model_class(model_name):
+    model_name = model_name.lower()
+    model_name_to_class = {
+        'unet++': NestedUNet,
+        'wnet2d': WNet2D,
+        'swinunet': SwinUnet,
+        'msunet': MSU_Net,
+        'cenet': CENet,
+        'r2unet': R2UNet,
+        'rvb_sin': VesselSegNetwork,
+        'ce_net': CE_Net,
+        'rrwnet': RRWNet,
+        'iternet': Iternet,
+        'attentionunet': AttentionUNet,
+        'cstanet': CSTANet,
+        'wnet': WNet,
+        'uresnet': UResNet,
+        'unet': UNet,
+    }
+    for key, cls in model_name_to_class.items():
+        if key in model_name:
+            return cls
+    raise ValueError(f"Unknown model type for name: {model_name}")
+
+def predict_and_show(model, val_loader, cmap='viridis', multi=None, n=20):
+    # predict masks
+    masks_pred = []
+    inputs = []
+    targets = []
+    multi = multi
+    for input, target in iter(val_loader):
+        mask = model.predict(input.cuda())
+        multi = mask.shape[1] > 1
+
+        mask = torch.sigmoid(mask)
+        mask[mask<0.5] = 0
+        mask[mask>=0.5] = 1
+
+        inputs.append(input.squeeze(0).cpu().numpy())
+        masks_pred.append(mask.squeeze(0).cpu().detach().numpy())
+        targets.append(target.squeeze(0).cpu().numpy())
+    data_utils.show_masks(inputs, targets, masks_pred, multi=multi, cmap=cmap, n=n)
+
+def evaluate_model(
+    model,
+    model_name,
+    dataloader,
+    metrics,
+    device='cuda',
+    per_class_metrics=False,
+    per_sample_metrics=False,
+    n_classes=2,
+    show_results=False,
+    n=3
+):
+    """ Evaluate a model on a dataloader using specified metrics.
+    Args:
+        model: The model to evaluate.
+        model_name (str): Name of the model.
+        dataloader (DataLoader): Dataloader for evaluation.
+        metrics (List[Tuple[str, callable]]): List of (name, metric_fn) pairs.
+        device (str): 'cpu' or 'cuda'.
+        per_class_metrics (bool): Whether to compute metrics per class. Used for class imbalance analysis.
+        per_sample_metrics (bool): Whether to compute metrics per sample. Used for outlier detection.
+        n_classes (int): Number of classes.
+        show_results (bool): Whether to display evaluation results.
+        n (int): Number of samples to display if show_results is True.
+    Returns:
+        Dict: Average metrics and optionally per-sample results.
+    """
+    metric_sums = {}
+    if per_class_metrics:
+        for name, _ in metrics:
+            for c in range(n_classes):
+                metric_sums[f"{name}_class_{c}"] = 0.0
+    else:
+        metric_sums = {name: 0.0 for name, _ in metrics}
+
+    num_samples = 0
+    per_sample_results = []
+
+    for xb, yb in tqdm.tqdm(dataloader):
+        xb, yb = xb.to(device), yb.to(device)
+
+        pred = model.predict(xb)
+
+        yb = torch.Tensor(yb)
+        pred = torch.Tensor(pred)
+
+        for i in range(xb.shape[0]):
+            num_samples += 1
+
+            if per_sample_metrics:
+                sample_entry = {
+                    "model": model_name,
+                    "sample_idx": num_samples - 1
+                }
+
+            for name, fn in metrics:
+                if per_class_metrics:
+                    res = fn(pred[i:i+1], yb[i:i+1], return_per_class=True)
+
+                    for c in range(n_classes):
+                        key = f"{name}_class_{c}"
+                        metric_sums[key] += res[c]
+
+                        if per_sample_metrics:
+                            sample_entry[key] = res[c]
+                else:
+                    val = fn(pred[i:i+1], yb[i:i+1]).item()
+                    metric_sums[name] += val
+
+                    if per_sample_metrics:
+                        sample_entry[name] = val
+
+            if per_sample_metrics:
+                per_sample_results.append(sample_entry)
+
+    avg_metrics = {k: v / num_samples for k, v in metric_sums.items()}
+    avg_metrics["model"] = model_name
+
+    # timing + params
+    input_tensor = torch.randn_like(xb[:1])
+    avg_metrics["inference_time"] = model.inference_time(input_tensor)
+    avg_metrics["num_parameters"] = model.num_parameters()
+
+    if show_results:
+        x, y = next(iter(dataloader))
+        multi = x.shape[1] > 1
+        print(f"Model: {model_name}")
+        print(f"{multi=}")
+        predict_and_show(model, dataloader, n=n, cmap='gray', multi=multi)
+
+    if per_sample_metrics:
+        return avg_metrics, per_sample_results
+
+    return avg_metrics
+
+
+def evaluate_models(
+    model_paths,
+    dataloader,
+    metrics,
+    input_channels=1,
+    num_classes=2,
+    device='cuda',
+    results=[],
+    per_class_metrics=False,
+    per_sample_metrics=False,
+    show_results=False,
+    n=3,
+    extension = ".onnx",
+):
+    """ Evaluate multiple models and return their metrics.
+    Args:
+        model_paths (List[str]): List of paths to model files.
+        dataloader (DataLoader): Dataloader for evaluation.
+        metrics (List[Tuple[str, callable]]): List of (name, metric_fn) pairs.
+        input_channels (int): Number of input channels for the models.
+        num_classes (int): Number of output classes for the models.
+        device (str): 'cpu' or 'cuda'.
+        results (List[Dict]): List to append results to. If empty, a new list will be created.
+        per_class_metrics (bool): Whether to compute metrics per class. Used for class imbalance analysis.
+        per_sample_metrics (bool): Whether to compute metrics per sample. Used for outlier detection.
+        show_results (bool): Whether to display evaluation results.
+        n (int): Number of samples to display if show_results is True.
+        extension (str): File extension of the model files (e.g., ".onnx", ".pt").
+    Returns:
+        List[Dict]: List of average metrics for each model and optionally per-sample results.
+    """
+    all_per_sample = []
+
+    for model_path in model_paths:
+        model = load_model(model_path, extension=extension, in_channels=input_channels, num_classes=num_classes, device=device)[1]
+        model_name = Path(model_path).stem
+
+        print(f"Evaluating {model_name}")
+
+        if per_sample_metrics:
+            model_metrics, per_sample = evaluate_model(model, model_name, dataloader, metrics, device=device, per_class_metrics=per_class_metrics, per_sample_metrics=per_sample_metrics, n_classes=num_classes, show_results=show_results, n=n)
+            all_per_sample.extend(per_sample)
+        else:
+            model_metrics = evaluate_model(model, model_name, dataloader, metrics, device=device, per_class_metrics=per_class_metrics, per_sample_metrics=False, n_classes=num_classes, show_results=show_results, n=n)
+        results.append(model_metrics)
+
+        del model
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    if per_sample_metrics:
+        return results, all_per_sample
+    return results
+
+def load_model(model_path, extension, in_channels, num_classes, device='cuda'):
+    model_name = Path(model_path).stem
+    if extension == ".onnx":
+        return model_name, ONNXModel(model_path, device)
+
+    elif extension == ".pt":
+        return model_name, TorchScriptModel(model_path, device)
+
+    elif extension == ".pth":
+        model_fn = get_model_class(model_name)
+        if model_fn is None:
+            raise ValueError("model_fn required for state_dict")
+        return model_name, StateDictModel(model_path, model_fn, in_channels, num_classes, device)
+    else:
+        raise ValueError(f"Unsupported model extension: {extension}")
+
+def load_models(model_paths, extension, in_channels, num_classes, device='cuda'):
+    models = []
+
+    for path in model_paths:
+        models.append(load_model(path, extension, in_channels, num_classes, device))
+
+    return models
+
+def get_filtered_model_paths(folder, extension=".onnx", keys=None):
+    all_paths = list(Path(folder).glob(f"*{extension}"))
+    if keys:
+        filtered = []
+        for p in all_paths:
+            filename = p.name  # Just the filename, e.g., 'uresnet_model.onnx'
+            for k in keys:
+                if k in filename:
+                    print(f"Model {filename} matches key: {k}")
+                    filtered.append(str(p))
+        return filtered
+    return [str(p) for p in all_paths]
