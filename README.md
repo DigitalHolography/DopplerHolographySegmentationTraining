@@ -2,7 +2,7 @@
 
 Deep learning framework for retinal vessel segmentation from Doppler holography images.
 
-This repository contains the training and evaluation code used in the article **"Improving segmentation of retinal arteries and veins using cardiac signal in doppler holograms"** (ISBI 2026). It provides implementations of several segmentation architectures, loss functions, metrics, and utilities for reproducible experiments on holographic Doppler imaging data.
+This repository contains the training and evaluation code used in the article **"Improving segmentation of retinal arteries and veins using cardiac signal in doppler holograms"** accepted at ISBI2026 ([IEEE](https://ieeexplore.ieee.org/document/11515426), [Arxiv](https://ieeexplore.ieee.org/document/11515426)). It provides implementations of several segmentation architectures, loss functions, metrics, and utilities for reproducible experiments on holographic Doppler imaging data.
 
 The corresponding dataset is available on Hugging Face:
 **https://huggingface.co/datasets/DigitalHolography/**
@@ -29,7 +29,7 @@ pip install -r requirements.txt
 
 ## Usage
 
-The main entry point is the `training.ipynb` notebook, which provides examples for:
+The main entry point is the `model_benchmark.ipynb` notebook, which provides examples for:
 
 * Loading the dataset
 * Training segmentation models
